@@ -1,9 +1,7 @@
 #include <Arduino.h>
 #include <ucode.h>
-#include <QuickPID.h>
-#include <Smoothed.h>
-// #include <TimerInterrupt_Generic.h>
-// #include <ISR_Timer_Generic.h>
+#include <CircularBuffer.hpp>
+
 // #define PROTOTYPE
 
 #define ENABLE_PRINT
@@ -13,6 +11,8 @@
 #define SERVO_RT 14
 #define SERVO_RB 16
 
+#define SERVO_CLAW 3
+
 #define LRSMALLBIAS 1000
 #define LRLARGEBIAS 500
 
@@ -21,32 +21,64 @@
 
 #define MAXTURNRPM 90
 #define NORMALTURNRPM 70
-#define MAXSTRAIGHTRPM 100
-#define NORMALSTRAIGHTRPM 70
+#define MAXSTRAIGHTRPM 70
+#define NORMALSTRAIGHTRPM 10
 
 #define WHEEL_DIAMETER_cm 6
 #define ONE_REVOLUTION_DISTANCE WHEEL_DIAMETER_cm *PI
 #define ONE_RPM_IN_UCODE 4
 
-#define USE_TIMER_1 true
-#define USE_TIMER_2 false
-#define USE_TIMER_3 false
-#define USE_TIMER_4 false
-#define USE_TIMER_5 false
+#define IGNORE_TIME_MILLIS 1000
 
 // float Setpoint = 3500;
-float Kp = 25.3;
-float Ki = 0;
-float Kd = 18;
+double Kp = 10.0;
+double Ki = 0;
+double Kd = 4.0;
+
+enum INSTRUCTIONS
+{
+  LEFT,
+  RIGHT,
+  SKIP,
+  RET,
+  OPN,
+  CLS
+};
+
+// INSTRUCTIONS inst_queue[] = {RIGHT, LEFT, SKIP, REV, SKIP, RIGHT};
+
+static INSTRUCTIONS inst_queue[] = {RIGHT, SKIP, SKIP, SKIP, SKIP, LEFT};
+
+INSTRUCTIONS current_inst = inst_queue[0];
+
+int turntime = 1300;
 
 bool plotEnable = false;
 
-struct DISTANCE_UNIT
-{
-  float CM = 1;
-  float INCH = 2.54;
-  float MM = 0.1;
-} DISTANCE_UNIT;
+bool ignore_out_sens = false;
+
+bool returning_from_obj = false;
+
+bool start_return = false;
+
+bool is_double_branch = false;
+
+bool reverse = false;
+
+int lasterror = 0;
+int P, I, D = 0;
+
+uint8_t max_inst_index = sizeof(inst_queue) / sizeof(INSTRUCTIONS);
+
+uint8_t curr_inst_index = 0;
+
+uint16_t ignore_out_sens_counter = 0;
+
+uint16_t ignore_double_branch_counter = 0;
+
+int right_count = 0;
+int left_count = 0;
+int obj_count = 0;
 
 void FWD(int spd)
 {
@@ -88,22 +120,15 @@ void STP()
   setServoStop(SERVO_RB);
 }
 
-void FWD_DISTANCE(int dist, float distance_multiplier, int RPM)
+void inc_inst()
 {
-  RPM = constrain(RPM, 0, 60);
-  float revolutions = (dist * distance_multiplier) / (ONE_REVOLUTION_DISTANCE); // all is in cm
-  Serial.print("num revolutions:");
-  Serial.println(revolutions);
-  float runTime = (revolutions * 1000 / (RPM * 60));
-  int speed = RPM * ONE_RPM_IN_UCODE;
-  Serial.print("running at speed:");
-  Serial.println(speed);
-  Serial.print("With runtime:");
-  Serial.println(runTime);
-  FWD(speed);
-  Serial.println("lmao");
-  delay(runTime);
-  STP();
+  Serial.println("index inc");
+  Serial.print("max: ");
+  Serial.println(max_inst_index);
+  curr_inst_index == max_inst_index - 1 ? curr_inst_index = curr_inst_index : curr_inst_index++;
+  current_inst = inst_queue[curr_inst_index];
+  Serial.print("curr index:");
+  Serial.println(curr_inst_index);
 }
 
 void setup()
@@ -114,6 +139,7 @@ void setup()
   // Initialization();
   if (protocolRunState == false)
   {
+    setEyelightAllPetals(1, 255, 51, 204);
   }
 }
 
@@ -121,14 +147,6 @@ void loop()
 {
   if (protocolRunState == false)
   {
-#ifdef PROTOTYPE
-    FWD_DISTANCE(10, DISTANCE_UNIT.CM, 100);
-    delay(4000);
-#endif
-
-#ifndef PROTOTYPE
-    int lasterror = 0;
-    int P, I, D = 0;
     // LINE SENSOR VALUE, 1 MEANS ON LINE, 0 MEANS OFF LINE
 
     //  middle
@@ -140,39 +158,134 @@ void loop()
     int linesens1 = readGrayValue(1, 0);
     int linesens5 = readGrayValue(5, 0);
 
-    // leftfavg.reading(linesens1 + linesens2);
-    // rightavg.reading(linesens4 + linesens5);
-
-    // int error = rightavg.getAvg() - leftfavg.getAvg(); // left decrements error, right increases
-
-    bool leftbranch = linesens1 & linesens2;
-    bool rightbranch = linesens4 & linesens5;
-
     int error = linesens4 * LRSMALLBIAS - linesens2 * LRSMALLBIAS;
 
-    if (leftbranch & rightbranch)
+    if (linesens1 | linesens5)
     {
-      LFT(80);
-      Serial.println("middle");
-    }
-    else if (leftbranch)
-    {
-      LFT(80);
-      Serial.println("lft");
-      delay(2500);
+      // stabilize sensor readin
       STP();
+
+      delay(250);
+
+      linesens1 = readGrayValue(1, 0);
+      linesens5 = readGrayValue(5, 0);
+
+      setEyelightAllPetals(1, 108, 15, 247);
+
+      // Serial.println("huh");
+
+      Serial.print("current instruction:");
+      switch (current_inst)
+      {
+      case LEFT:
+        Serial.println("left");
+        if (linesens5 && !ignore_out_sens)
+        {
+          setEyelightAllPetals(1, 255, 0, 0);
+          FWD(130);
+          delay(300);
+          LFT(100);
+          delay(turntime);
+          STP();
+          ignore_out_sens = true;
+          ignore_out_sens_counter = millis();
+          inc_inst();
+          Serial.println("lft");
+        }
+        break;
+
+      case RIGHT:
+        Serial.println("right");
+        if (linesens1 && !ignore_out_sens)
+        {
+          setEyelightAllPetals(1, 0, 255, 0);
+          FWD(130);
+          delay(300);
+          RGT(100);
+          delay(turntime);
+          STP();
+          ignore_out_sens = true;
+          ignore_out_sens_counter = millis();
+          inc_inst();
+          Serial.println("rgt");
+        }
+        break;
+
+      case RET:
+        Serial.println("ret");
+        break;
+
+      case SKIP:
+        Serial.println("skip");
+        FWD(100);
+        delay(200);
+        STP();
+        inc_inst();
+        break;
+
+      case OPN:
+        Serial.println("open");
+        break;
+
+      case CLS:
+        Serial.println("close");
+        break;
+
+      default:
+        break;
+      }
+
+      if (linesens1 && linesens5 && !returning_from_obj)
+      {
+        // objective box or branch
+        STP();
+        Serial.println(linesens1);
+        Serial.println(linesens5);
+        delay(100);
+        // returning_from_obj = true;
+        // start_return = true;
+        setEyelightAllPetals(1, 247, 15, 15);
+        // Serial.println("bruh");
+      }
     }
-    else if (rightbranch)
+    else if (returning_from_obj | (start_return && linesens1 && linesens5))
     {
-      RGT(50);
-      Serial.println("rgt");
-      delay(2500);
+      BWD(200);
+      delay(100);
       STP();
+
+      reverse = true;
+
+      while (true)
+      {
+        if (reverse)
+        {
+          setRgbledColor(245, 66, 96);
+        }
+        linesens1 = readGrayValue(1, 0);
+        linesens5 = readGrayValue(5, 0);
+        setEyelightAllPetals(1, 233, 245, 66);
+        if (linesens1 && linesens5)
+        {
+          STP();
+          start_return = false;
+          reverse = false;
+          Serial.println("end reverse");
+          break;
+        }
+        Serial.println("reversing..");
+        BWD(MAXSTRAIGHTRPM);
+      }
     }
     else
     {
+      // Serial.println("pid");
+      ignore_out_sens ? setEyelightAllPetals(1, 255, 102, 102) : setEyelightAllPetals(1, 0, 255, 204);
 
-      Serial.println("pid");
+      if (ignore_out_sens && (millis() - ignore_out_sens_counter >= IGNORE_TIME_MILLIS))
+      {
+        ignore_out_sens = false;
+      }
 
       P = error;
 
@@ -182,7 +295,7 @@ void loop()
 
       lasterror = error;
 
-      int result = P * Kp + I * Ki + D * Kd;
+      int result = reverse ? -(P * Kp + I * Ki + D * Kd) : P * Kp + I * Ki + D * Kd;
 
       if (result > 0) // to right
       {
@@ -194,8 +307,16 @@ void loop()
       }
       if (result == 0)
       {
-        FWD(MAXSTRAIGHTRPM);
+        reverse ? BWD(MAXSTRAIGHTRPM) : FWD(MAXSTRAIGHTRPM);
       }
+    }
+    if (current_inst == OPN)
+    {
+      setServoAngle(SERVO_CLAW, 90, 10);
+    }
+    if (current_inst == CLS)
+    {
+      setServoAngle(SERVO_CLAW, -70, 10);
     }
 
 #ifdef ENABLE_PRINT
@@ -247,13 +368,16 @@ void loop()
         Serial.print("plotting: ");
         Serial.println(plotEnable);
         break;
+      case 't':
+        turntime = incoming.substring(1).toInt();
+        Serial.print("turntime set to:");
+        Serial.println(turntime);
+
       default:
         Serial.println("nuhuh");
         break;
       }
     }
 #endif
-
-#endif // PROTOTYPE
   }
 }
